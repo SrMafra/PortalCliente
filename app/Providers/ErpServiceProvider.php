@@ -14,8 +14,6 @@ class ErpServiceProvider extends ServiceProvider
      */
     public function register()
     {
-        // Registra o ErpApiService como um singleton
-        // Isso significa que a mesma instância será usada em toda a aplicação
         $this->app->singleton(ErpApiService::class, function ($app) {
             return new ErpApiService();
         });
@@ -28,8 +26,6 @@ class ErpServiceProvider extends ServiceProvider
      */
     public function boot()
     {
-        // Aqui você pode colocar código que deve ser executado 
-        // após todos os outros provedores de serviço terem sido registrados
-        // Por exemplo: registrar eventos, publicar arquivos de configuração, etc.
+        // Código para inicialização do serviço, se necessário
     }
 }
