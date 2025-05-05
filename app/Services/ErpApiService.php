@@ -5,357 +5,251 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use App\Exceptions\ApiException;
-use Exception;
 
 class ErpApiService
 {
     protected $baseUrl;
-    protected $timeout;
-    protected $apiKey;
-    protected $cacheEnabled;
-    protected $cacheTtl;
-    protected $endpoints;
-    protected $empresaPadrao;
-
-    /**
-     * Construtor do serviço
-     */
+    protected $apiToken;
+    protected $cacheExpiration;
+    
     public function __construct()
     {
-        $this->baseUrl = config('erp.url');
-        $this->timeout = config('erp.timeout');
-        $this->apiKey = config('erp.api_key');
-        $this->cacheEnabled = config('erp.cache.enabled');
-        $this->cacheTtl = config('erp.cache.ttl');
-        $this->endpoints = config('erp.endpoints');
-        $this->empresaPadrao = config('erp.empresa_padrao');
-
-        // Verificar se a chave API está configurada
-        if (empty($this->apiKey)) {
-            Log::warning('API ERP: Chave de API não configurada');
-        }
+        $this->baseUrl = env('ERP_API_BASE_URL');
+        $this->apiToken = env('ERP_API_TOKEN');
+        $this->cacheExpiration = env('ERP_API_CACHE_MINUTES', 60); // Padrão: 60 minutos
     }
-
+    
     /**
-     * Obtém os dados do cliente pelo ID
+     * Obtém títulos em aberto para um cliente
      *
-     * @param string $id ID do cliente
-     * @param string|null $empresa Código da empresa
+     * @param int $clienteId
+     * @param array $filtros
      * @return array
-     * @throws ApiException
      */
-    public function getCliente($id, $empresa = null)
+    public function getTitulosEmAberto($clienteId, $filtros = [])
     {
-        $empresa = $empresa ?? $this->empresaPadrao;
-        $endpoint = str_replace('{id}', $id, $this->endpoints['cliente']['show']);
-
-        // Chave para cache
-        $cacheKey = "cliente_{$empresa}_{$id}";
-
-        // Verificar cache
-        if ($this->cacheEnabled && Cache::has($cacheKey)) {
-            return Cache::get($cacheKey);
-        }
-
-        $response = $this->makeRequest('GET', $endpoint, [
-            'empresa' => $empresa
-        ]);
-
-        // Armazenar em cache
-        if ($this->cacheEnabled) {
-            Cache::put($cacheKey, $response, $this->cacheTtl * 60);
-        }
-
-        return $response;
-    }
-
-    /**
-     * Obtém lista de títulos em aberto
-     *
-     * @param array $params Parâmetros da consulta
-     * @param bool $returnRaw Retornar resposta completa (com token de continuação)
-     * @return array
-     * @throws ApiException
-     */
-    public function getTitulosEmAberto($params = [], $returnRaw = false)
-    {
-        $endpoint = $this->endpoints['titulos']['lista'];
-
-        // Garantir que busca apenas títulos em aberto
-        $params['tipoTitulo'] = 0;
-
-        // Chave para cache
-        $cacheKey = 'titulos_' . md5(json_encode($params));
-
-        // Verificar cache
-        if ($this->cacheEnabled && Cache::has($cacheKey)) {
-            $response = Cache::get($cacheKey);
-            return $returnRaw ? $response : ($response['data'] ?? $response);
-        }
-
-        $response = $this->makeRequest('GET', $endpoint, $params);
-
-        // Armazenar em cache (com TTL menor para títulos)
-        if ($this->cacheEnabled) {
-            Cache::put($cacheKey, $response, 15 * 60); // 15 minutos
-        }
-
-        // Retornar resposta completa ou apenas os dados
-        return $returnRaw ? $response : ($response['data'] ?? $response);
-    }
-
-    /**
-     * Gera boleto para uma nota fiscal
-     *
-     * @param string $notaFiscal Número da nota fiscal
-     * @param string $cnpj CNPJ do cliente
-     * @param string|null $empresa Código da empresa
-     * @return string Base64 do PDF do boleto
-     * @throws ApiException
-     */
-    public function gerarBoleto($notaFiscal, $cnpj, $empresa = null)
-    {
-        $empresa = $empresa ?? $this->empresaPadrao;
-        $endpoint = str_replace('{notaFiscal}', $notaFiscal, $this->endpoints['titulos']['boleto']);
-
-        try {
-            // Fazer a requisição diretamente para ter mais controle
-            $url = $this->baseUrl . $endpoint;
-
-            $request = Http::timeout($this->timeout)
-                ->withHeaders([
-                    'accept' => 'application/json',
-                    'empresa' => $empresa,
-                    'Authorization' => $this->apiKey
-                ])
-                ->withoutVerifying(); // Desabilitar verificação SSL
-
-            $response = $request->get($url, [
-                'cliente' => $cnpj
-            ]);
-
-            // Log completo da resposta para debug
-            Log::debug('Resposta da API de boleto', [
-                'status' => $response->status(),
-                'url' => $url,
-                'notaFiscal' => $notaFiscal,
-                'cliente' => $cnpj,
-                'headers' => $response->headers(),
-                'content_type' => $response->header('Content-Type'),
-                'body' => $response->body() // Log do corpo completo para investigação
-            ]);
-
-            // Verificar status da resposta
-            if ($response->failed()) {
-                $statusCode = $response->status();
-                $errorMsg = $response->json()['message'] ?? "Erro $statusCode";
-
-                throw new ApiException("Falha ao gerar boleto: $errorMsg", $statusCode);
-            }
-
-            // Verificar o tipo de conteúdo para determinar como processar
-            $contentType = $response->header('Content-Type');
-
-            if (strpos($contentType, 'application/json') !== false) {
-                // Se a resposta for JSON, verificar se há um campo com o PDF em base64
-                $data = $response->json();
-
-                // Log dos campos disponíveis no JSON
-                Log::debug('Campos disponíveis no JSON da resposta:', [
-                    'campos' => array_keys($data)
-                ]);
-
-                // Verificar vários campos possíveis onde o PDF pode estar
-                $possibleFields = ['pdf', 'base64', 'content', 'documento', 'boleto', 'arquivo'];
-                foreach ($possibleFields as $field) {
-                    if (isset($data[$field]) && !empty($data[$field])) {
-                        return $data[$field];
-                    }
-                }
-
-                // Se não encontrar em campos específicos, procurar por qualquer campo com conteúdo base64 grande
-                foreach ($data as $key => $value) {
-                    if (is_string($value) && strlen($value) > 1000) {
-                        // Provavelmente é o conteúdo do PDF em base64
-                        return $value;
-                    }
-                }
-
-                throw new ApiException("Resposta JSON não contém o PDF do boleto. Campos disponíveis: " . implode(", ", array_keys($data)));
-            } else if (strpos($contentType, 'application/pdf') !== false) {
-                // Se a resposta for diretamente um PDF, converter para base64
-                return base64_encode($response->body());
-            } else {
-                // Assumir que o corpo da resposta já é o PDF em base64 ou o próprio PDF
-                $body = $response->body();
-
-                // Verificar se parece um base64 válido
-                if (preg_match('/^[a-zA-Z0-9\/\r\n+]*={0,2}$/', $body)) {
-                    return $body; // Já é base64
+        $cacheKey = "titulos_aberto_cliente_{$clienteId}_" . md5(json_encode($filtros));
+        
+        return Cache::remember($cacheKey, $this->cacheExpiration * 60, function () use ($clienteId, $filtros) {
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiToken}",
+                    'Accept' => 'application/json',
+                ])->get("{$this->baseUrl}/clientes/{$clienteId}/titulos/abertos", $filtros);
+                
+                if ($response->successful()) {
+                    return $response->json();
                 } else {
-                    // Provavelmente é o PDF binário
-                    return base64_encode($body);
+                    Log::error('Erro ao obter títulos em aberto do ERP', [
+                        'status' => $response->status(),
+                        'response' => $response->body(),
+                        'cliente_id' => $clienteId
+                    ]);
+                    return ['error' => true, 'message' => 'Não foi possível recuperar os títulos em aberto.'];
                 }
+            } catch (\Exception $e) {
+                Log::error('Exceção ao conectar com a API do ERP', [
+                    'message' => $e->getMessage(),
+                    'cliente_id' => $clienteId
+                ]);
+                return ['error' => true, 'message' => 'Erro de conexão com o sistema ERP.'];
+            }
+        });
+    }
+    
+    /**
+     * Obtém títulos pagos para um cliente
+     *
+     * @param int $clienteId
+     * @param array $filtros
+     * @return array
+     */
+    public function getTitulosPagos($clienteId, $filtros = [])
+    {
+        $cacheKey = "titulos_pagos_cliente_{$clienteId}_" . md5(json_encode($filtros));
+        
+        return Cache::remember($cacheKey, $this->cacheExpiration * 60, function () use ($clienteId, $filtros) {
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiToken}",
+                    'Accept' => 'application/json',
+                ])->get("{$this->baseUrl}/clientes/{$clienteId}/titulos/pagos", $filtros);
+                
+                if ($response->successful()) {
+                    return $response->json();
+                } else {
+                    Log::error('Erro ao obter títulos pagos do ERP', [
+                        'status' => $response->status(),
+                        'response' => $response->body(),
+                        'cliente_id' => $clienteId
+                    ]);
+                    return ['error' => true, 'message' => 'Não foi possível recuperar os títulos pagos.'];
+                }
+            } catch (\Exception $e) {
+                Log::error('Exceção ao conectar com a API do ERP', [
+                    'message' => $e->getMessage(),
+                    'cliente_id' => $clienteId
+                ]);
+                return ['error' => true, 'message' => 'Erro de conexão com o sistema ERP.'];
+            }
+        });
+    }
+    
+    /**
+     * Obtém detalhes de um título específico
+     *
+     * @param int $clienteId
+     * @param string $tituloId
+     * @return array
+     */
+    public function getDetalhesTitulo($clienteId, $tituloId)
+    {
+        $cacheKey = "titulo_detalhe_{$clienteId}_{$tituloId}";
+        
+        return Cache::remember($cacheKey, $this->cacheExpiration * 60, function () use ($clienteId, $tituloId) {
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiToken}",
+                    'Accept' => 'application/json',
+                ])->get("{$this->baseUrl}/clientes/{$clienteId}/titulos/{$tituloId}");
+                
+                if ($response->successful()) {
+                    return $response->json();
+                } else {
+                    Log::error('Erro ao obter detalhes do título no ERP', [
+                        'status' => $response->status(),
+                        'response' => $response->body(),
+                        'cliente_id' => $clienteId,
+                        'titulo_id' => $tituloId
+                    ]);
+                    return ['error' => true, 'message' => 'Não foi possível recuperar os detalhes do título.'];
+                }
+            } catch (\Exception $e) {
+                Log::error('Exceção ao conectar com a API do ERP', [
+                    'message' => $e->getMessage(),
+                    'cliente_id' => $clienteId,
+                    'titulo_id' => $tituloId
+                ]);
+                return ['error' => true, 'message' => 'Erro de conexão com o sistema ERP.'];
+            }
+        });
+    }
+    
+    /**
+     * Obtém informações do cliente
+     *
+     * @param int $clienteId
+     * @return array
+     */
+    public function getDadosCliente($clienteId)
+    {
+        $cacheKey = "dados_cliente_{$clienteId}";
+        
+        return Cache::remember($cacheKey, $this->cacheExpiration * 60, function () use ($clienteId) {
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->apiToken}",
+                    'Accept' => 'application/json',
+                ])->get("{$this->baseUrl}/clientes/{$clienteId}");
+                
+                if ($response->successful()) {
+                    return $response->json();
+                } else {
+                    Log::error('Erro ao obter dados do cliente no ERP', [
+                        'status' => $response->status(),
+                        'response' => $response->body(),
+                        'cliente_id' => $clienteId
+                    ]);
+                    return ['error' => true, 'message' => 'Não foi possível recuperar os dados do cliente.'];
+                }
+            } catch (\Exception $e) {
+                Log::error('Exceção ao conectar com a API do ERP', [
+                    'message' => $e->getMessage(),
+                    'cliente_id' => $clienteId
+                ]);
+                return ['error' => true, 'message' => 'Erro de conexão com o sistema ERP.'];
+            }
+        });
+    }
+    
+    /**
+     * Obtém link de boleto para um título
+     *
+     * @param int $clienteId
+     * @param string $tituloId
+     * @return string|null
+     */
+    public function getLinkBoleto($clienteId, $tituloId)
+    {
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$this->apiToken}",
+                'Accept' => 'application/json',
+            ])->get("{$this->baseUrl}/clientes/{$clienteId}/titulos/{$tituloId}/boleto");
+            
+            if ($response->successful()) {
+                $data = $response->json();
+                return $data['link_boleto'] ?? null;
+            } else {
+                Log::error('Erro ao obter link do boleto no ERP', [
+                    'status' => $response->status(),
+                    'response' => $response->body(),
+                    'cliente_id' => $clienteId,
+                    'titulo_id' => $tituloId
+                ]);
+                return null;
             }
         } catch (\Exception $e) {
-            Log::error('Erro ao gerar boleto: ' . $e->getMessage(), [
-                'notaFiscal' => $notaFiscal,
-                'cliente' => $cnpj
+            Log::error('Exceção ao conectar com a API do ERP', [
+                'message' => $e->getMessage(),
+                'cliente_id' => $clienteId,
+                'titulo_id' => $tituloId
             ]);
-            throw new ApiException("Erro ao gerar boleto: " . $e->getMessage());
+            return null;
         }
     }
-
+    
     /**
-     * Obtém lista de boletos pagos
+     * Limpa o cache relacionado a um cliente específico
      *
-     * @param string $dataInicio Data inicial (YYYY-MM-DD)
-     * @param string $dataFim Data final (YYYY-MM-DD)
-     * @param string|null $empresa Código da empresa
-     * @param bool $returnRaw Retornar resposta completa (com token de continuação)
-     * @return array
-     * @throws ApiException
+     * @param int $clienteId
      */
-    public function getBoletosPagos($dataInicio, $dataFim, $empresa = null, $returnRaw = false)
+    public function limparCacheCliente($clienteId)
     {
-        $empresa = $empresa ?? $this->empresaPadrao;
-        $endpoint = $this->endpoints['titulos']['pagos'];
-
-        // Chave para cache
-        $cacheKey = "titulos_pagos_{$empresa}_{$dataInicio}_{$dataFim}";
-
-        // Verificar cache
-        if ($this->cacheEnabled && Cache::has($cacheKey)) {
-            $response = Cache::get($cacheKey);
-            // Se estiver no cache, retornar o formato correto
-            if ($returnRaw) {
-                return $response;
+        $cacheKeys = [
+            "dados_cliente_{$clienteId}",
+            "titulos_aberto_cliente_{$clienteId}_*",
+            "titulos_pagos_cliente_{$clienteId}_*",
+            "titulo_detalhe_{$clienteId}_*"
+        ];
+        
+        foreach ($cacheKeys as $pattern) {
+            if (strpos($pattern, '*') !== false) {
+                $this->limparCachePorPadrao($pattern);
             } else {
-                return $response['titulosPagos'] ?? $response['data'] ?? $response;
-            }
-        }
-
-        $response = $this->makeRequest('GET', $endpoint, [
-            'empresa' => $empresa,
-            'dataInicio' => $dataInicio,
-            'dataFim' => $dataFim,
-            'paginacao' => 50 // Adicionar paginação
-        ]);
-
-        // Armazenar em cache
-        if ($this->cacheEnabled) {
-            Cache::put($cacheKey, $response, $this->cacheTtl * 60);
-        }
-
-        // Log para debug
-        Log::debug('Resposta da API de boletos pagos', [
-            'campos_disponiveis' => array_keys($response),
-            'estrutura' => $response
-        ]);
-
-        // Retornar resposta completa ou apenas os dados
-        if ($returnRaw) {
-            return $response;
-        } else {
-            // Verificar os diferentes formatos possíveis da resposta
-            if (isset($response['titulosPagos'])) {
-                return $response['titulosPagos'];
-            } elseif (isset($response['data'])) {
-                return $response['data'];
-            } else {
-                return $response;
+                Cache::forget($pattern);
             }
         }
     }
-
+    
     /**
-     * Executa uma requisição para a API
+     * Método auxiliar para limpar cache usando padrões com wildcard
      *
-     * @param string $method Método HTTP
-     * @param string $endpoint Endpoint da API
-     * @param array $params Parâmetros da requisição
-     * @param bool $parseJson Converter resposta para JSON
-     * @return mixed
-     * @throws ApiException
+     * @param string $pattern
      */
-    protected function makeRequest($method, $endpoint, $params = [], $parseJson = true)
+    protected function limparCachePorPadrao($pattern)
     {
-        try {
-            $url = $this->baseUrl . $endpoint;
-
-            // Configurar cabeçalhos conforme o padrão da API
-            $request = Http::timeout($this->timeout)
-                ->withHeaders([
-                    'accept' => 'application/json',
-                    'empresa' => $params['empresa'] ?? $this->empresaPadrao,
-                    'Authorization' => $this->apiKey
-                ]);
-
-            // Remover 'empresa' dos parâmetros se estiver presente pois já foi enviado no cabeçalho
-            if (isset($params['empresa'])) {
-                unset($params['empresa']);
-            }
-
-            // Verificar SSL (importante em ambientes de desenvolvimento)
-            if (str_starts_with($this->baseUrl, 'https://')) {
-                if (!config('erp.ssl.verify', true)) {
-                    $request->withoutVerifying();
+        // Implementação básica que funciona para cache baseado em arquivos
+        // Para outros drivers, pode ser necessário implementar de forma diferente
+        if (Cache::getStore() instanceof \Illuminate\Cache\FileStore) {
+            $pattern = str_replace('*', '', $pattern);
+            $files = glob(storage_path('framework/cache/*'));
+            
+            foreach ($files as $file) {
+                if (strpos($file, $pattern) !== false) {
+                    @unlink($file);
                 }
             }
-
-            // Determinar se parâmetros vão na URL ou no corpo
-            $response = null;
-            if ($method === 'GET') {
-                $response = $request->get($url, $params);
-            } elseif ($method === 'POST') {
-                $response = $request->post($url, $params);
-            } elseif ($method === 'PUT') {
-                $response = $request->put($url, $params);
-            } elseif ($method === 'DELETE') {
-                $response = $request->delete($url, $params);
-            }
-
-            if (!$response) {
-                throw new ApiException("Método HTTP não suportado: $method");
-            }
-
-            // Log da resposta para debug se configurado
-            if (config('erp.log.responses', false)) {
-                Log::debug('API ERP Response', [
-                    'url' => $url,
-                    'method' => $method,
-                    'status' => $response->status(),
-                    'body' => substr($response->body(), 0, 500) . '...' // Limitar tamanho do log
-                ]);
-            }
-
-            // Verificar se houve falha na requisição
-            if ($response->failed()) {
-                $statusCode = $response->status();
-                $errorMsg = $response->json()['message'] ?? "Erro $statusCode";
-
-                Log::error('Erro na API ERP', [
-                    'url' => $url,
-                    'status' => $statusCode,
-                    'response' => substr($response->body(), 0, 500) . '...' // Limitar tamanho do log
-                ]);
-
-                throw new ApiException("Falha na requisição à API: $errorMsg", $statusCode);
-            }
-
-            // Retornar resposta conforme solicitado
-            if ($parseJson) {
-                return $response->json();
-            }
-
-            return $response->body();
-        } catch (Exception $e) {
-            Log::error('Erro ao fazer requisição para API do ERP: ' . $e->getMessage(), [
-                'endpoint' => $endpoint,
-                'method' => $method
-            ]);
-            throw new ApiException("Erro na comunicação com o ERP: " . $e->getMessage());
         }
     }
 }
